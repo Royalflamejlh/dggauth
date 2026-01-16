@@ -240,7 +240,6 @@ def auth(request: Request):
 
 
 
-
 @app.get("/whoami")
 def whoami(request: Request):
     cookie = request.cookies.get(COOKIE_NAME)
@@ -251,4 +250,11 @@ def whoami(request: Request):
     if not session:
         return JSONResponse({"authenticated": False}, status_code=401)
 
-    return JSONResponse(session.get("userinfo", {}))
+    return JSONResponse({
+        "authenticated": True,
+        "admin": bool(session.get("admin")),
+        "destiny_id": session.get("destiny_id", ""),
+        "username": session.get("username", ""),
+        "nick": session.get("nick", ""),
+        "userinfo": session.get("userinfo", {}),
+    })
