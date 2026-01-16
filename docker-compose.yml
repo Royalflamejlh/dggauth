@@ -41,7 +41,7 @@ services:
       - proxy
 
   test-app:
-    image: nginxdemos/hello
+    image: ealen/echo-server:latest
     container_name: testapp
     restart: unless-stopped
     networks:
