@@ -26,8 +26,8 @@ services:
     build: .
     container_name: destiny-auth
     environment:
-      DGG_CLIENT_ID: "fWI2SIME63TN63r1Gez33QoAJsOqILvP"
-      DGG_CLIENT_SECRET: "y/a.YL<KdVy/G@X4Cbp/4$.[T<Qu1Wj$QVL7cIXLBSb6G$[>YXJ@Alf7h$EfaF9e"
+      DGG_CLIENT_ID: "YOUR_DGG_CLIENT_ID"
+      DGG_CLIENT_SECRET: "YOUR_DGG_CLIENT_SECRET"
       REDIRECT_URI: "https://auth.dgglocal.com/callback"
       POST_LOGIN_REDIRECT: "https://app.dgglocal.com/"
       SESSION_SIGNING_KEY: "CHANGE_ME_TO_A_LONG_RANDOM_STRING"

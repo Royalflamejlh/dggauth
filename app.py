@@ -34,8 +34,8 @@ def make_state() -> str:
 
 def make_code_challenge(state: str) -> str:
     secret_hex = hashlib.sha256(DGG_CLIENT_SECRET.encode()).hexdigest()
-    digest = hashlib.sha256((state + secret_hex).encode()).digest()
-    challenge = base64.b64encode(digest).decode()
+    digest = hashlib.sha256((state + secret_hex).encode()).hexdigest()
+    challenge = base64.b64encode(digest.encode()).decode()
     print("DEBUG challenge inputs:")
     print("  state:", state)
     print("  secret_hex:", secret_hex)
