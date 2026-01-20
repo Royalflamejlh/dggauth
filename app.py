@@ -8,7 +8,7 @@ import json
 from typing import Dict, Tuple, Optional
 
 import requests
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import RedirectResponse, PlainTextResponse, JSONResponse
 
 app = FastAPI()
@@ -20,6 +20,7 @@ DGG_CLIENT_ID = os.environ["DGG_CLIENT_ID"]
 DGG_CLIENT_SECRET = os.environ["DGG_CLIENT_SECRET"]
 REDIRECT_URI = os.environ["REDIRECT_URI"]
 POST_LOGIN_REDIRECT = os.environ.get("POST_LOGIN_REDIRECT", "https://app.dgglocal.com/")
+POST_LOGOUT_REDIRECT = os.environ.get("POST_LOGOUT_REDIRECT", POST_LOGIN_REDIRECT)
 
 SESSION_SIGNING_KEY = os.environ["SESSION_SIGNING_KEY"].encode("utf-8")
 COOKIE_NAME = os.environ.get("COOKIE_NAME", "dgg_session")
@@ -131,6 +132,17 @@ def set_cookie(resp: RedirectResponse, cookie_val: str) -> None:
     )
 
 
+def clear_cookie(resp: Response) -> None:
+    resp.delete_cookie(
+        COOKIE_NAME,
+        domain=COOKIE_DOMAIN,
+        path="/",
+        secure=COOKIE_SECURE,
+        httponly=True,
+        samesite=COOKIE_SAMESITE,
+    )
+
+
 # -----------------------------
 # Routes
 # -----------------------------
@@ -238,6 +250,16 @@ def auth(request: Request):
     resp.headers["X-Dgg-AllowChatting"] = "true" if ui.get("allowChatting") else "false"
     return resp
 
+
+
+@app.get("/logout")
+def logout(redirect: bool = True):
+    if redirect:
+        resp = RedirectResponse(POST_LOGOUT_REDIRECT, status_code=302)
+    else:
+        resp = PlainTextResponse("logged out", status_code=200)
+    clear_cookie(resp)
+    return resp
 
 
 @app.get("/whoami")
