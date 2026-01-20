@@ -5,11 +5,15 @@ import base64
 import hashlib
 import hmac
 import json
-from typing import Dict, Tuple, Optional
+import threading
+from typing import Dict, Optional
 
 import requests
-from fastapi import FastAPI, Request, Response
+import mysql.connector
+from mysql.connector import pooling
+from fastapi import FastAPI, Request, Response, Header, HTTPException, APIRouter
 from fastapi.responses import RedirectResponse, PlainTextResponse, JSONResponse
+from pydantic import BaseModel
 
 app = FastAPI()
 
@@ -21,6 +25,13 @@ DGG_CLIENT_SECRET = os.environ["DGG_CLIENT_SECRET"]
 REDIRECT_URI = os.environ["REDIRECT_URI"]
 POST_LOGIN_REDIRECT = os.environ.get("POST_LOGIN_REDIRECT", "https://app.dgglocal.com/")
 POST_LOGOUT_REDIRECT = os.environ.get("POST_LOGOUT_REDIRECT", POST_LOGIN_REDIRECT)
+LINK_CODE_TTL_SECONDS = int(os.environ.get("LINK_CODE_TTL_SECONDS", "600"))
+LINK_SERVER_KEY = os.environ.get("LINK_SERVER_KEY")
+LINK_DB_HOST = os.environ.get("LINK_DB_HOST") or os.environ.get("DB_HOST")
+LINK_DB_PORT = int(os.environ.get("LINK_DB_PORT", os.environ.get("DB_PORT", "3306")))
+LINK_DB_USER = os.environ.get("LINK_DB_USER") or os.environ.get("DB_USER")
+LINK_DB_PASSWORD = os.environ.get("LINK_DB_PASSWORD") or os.environ.get("DB_PASSWORD")
+LINK_DB_NAME = os.environ.get("LINK_DB_NAME") or os.environ.get("DB_NAME")
 
 SESSION_SIGNING_KEY = os.environ["SESSION_SIGNING_KEY"].encode("utf-8")
 COOKIE_NAME = os.environ.get("COOKIE_NAME", "dgg_session")
@@ -39,6 +50,27 @@ USERINFO_URL = "https://www.destiny.gg/api/userinfo"
 
 # state -> expires_at
 STATE_STORE: Dict[str, float] = {}
+# link_code -> record
+LINK_CODES: Dict[str, dict] = {}
+# destiny_id -> link_code
+LINK_CODES_BY_USER: Dict[str, str] = {}
+
+DB_CONFIG = None
+if LINK_DB_HOST and LINK_DB_USER and LINK_DB_PASSWORD and LINK_DB_NAME:
+    DB_CONFIG = {
+        "host": LINK_DB_HOST,
+        "port": LINK_DB_PORT,
+        "user": LINK_DB_USER,
+        "password": LINK_DB_PASSWORD,
+        "database": LINK_DB_NAME,
+        "autocommit": True,
+    }
+
+DB_POOL: Optional[pooling.MySQLConnectionPool] = None
+DB_POOL_LOCK = threading.Lock()
+DB_POOL_READY = False
+
+link_router = APIRouter(prefix="/link")
 
 # -----------------------------
 # Helpers
@@ -141,6 +173,131 @@ def clear_cookie(resp: Response) -> None:
         httponly=True,
         samesite=COOKIE_SAMESITE,
     )
+
+
+def get_session_from_request(request: Request) -> Optional[dict]:
+    cookie = request.cookies.get(COOKIE_NAME)
+    if not cookie:
+        return None
+    return verify_session(cookie)
+
+
+def cleanup_link_codes():
+    now = time.time()
+    for code, record in list(LINK_CODES.items()):
+        if record.get("expires_at", 0) < now:
+            LINK_CODES.pop(code, None)
+            user_id = record.get("destiny_id")
+            if user_id and LINK_CODES_BY_USER.get(user_id) == code:
+                LINK_CODES_BY_USER.pop(user_id, None)
+
+
+def make_link_code(length: int = 8) -> str:
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    while True:
+        code = "".join(secrets.choice(alphabet) for _ in range(length))
+        if code not in LINK_CODES:
+            return code
+
+
+def get_destiny_id(session: dict) -> str:
+    if not session:
+        return ""
+    if session.get("destiny_id"):
+        return str(session["destiny_id"])
+    ui = session.get("userinfo") or {}
+    if ui.get("userId") is None:
+        return ""
+    return str(ui.get("userId"))
+
+
+def init_db_pool():
+    global DB_POOL_READY, DB_POOL
+    if DB_POOL_READY:
+        return
+    if not DB_CONFIG:
+        raise RuntimeError("Link DB env vars are not fully configured")
+    with DB_POOL_LOCK:
+        if DB_POOL_READY:
+            return
+        DB_POOL = pooling.MySQLConnectionPool(pool_name="link_pool", pool_size=5, **DB_CONFIG)
+        conn = DB_POOL.get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS link_bindings (
+                    id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                    destiny_id VARCHAR(64) NOT NULL,
+                    minecraft_uuid VARCHAR(64) NOT NULL,
+                    nick VARCHAR(255),
+                    username VARCHAR(255),
+                    linked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE KEY uq_destiny_id (destiny_id),
+                    UNIQUE KEY uq_minecraft_uuid (minecraft_uuid)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        DB_POOL_READY = True
+
+
+def get_db_connection():
+    init_db_pool()
+    if not DB_POOL:
+        raise RuntimeError("DB pool is not initialized")
+    return DB_POOL.get_connection()
+
+
+def save_link_binding(destiny_id: str, minecraft_uuid: str, nick: str, username: str):
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO link_bindings (destiny_id, minecraft_uuid, nick, username)
+            VALUES (%s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                minecraft_uuid = VALUES(minecraft_uuid),
+                nick = VALUES(nick),
+                username = VALUES(username),
+                linked_at = CURRENT_TIMESTAMP
+            """,
+            (destiny_id, minecraft_uuid, nick, username),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def fetch_link_binding(destiny_id: str) -> Optional[dict]:
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT destiny_id, minecraft_uuid, UNIX_TIMESTAMP(linked_at) AS linked_at, nick, username
+            FROM link_bindings
+            WHERE destiny_id = %s
+            """,
+            (destiny_id,),
+        )
+        row = cursor.fetchone()
+        return row
+    finally:
+        conn.close()
+
+
+def ensure_link_db():
+    if not DB_CONFIG:
+        raise HTTPException(status_code=500, detail="Link DB is not configured")
+
+
+class RedeemRequest(BaseModel):
+    code: str
+    minecraftUuid: str
 
 
 # -----------------------------
@@ -262,6 +419,114 @@ def logout(redirect: bool = True):
     return resp
 
 
+@link_router.post("/code")
+def create_link_code(request: Request):
+    cleanup_link_codes()
+    session = get_session_from_request(request)
+    if not session:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    destiny_id = get_destiny_id(session)
+    if not destiny_id:
+        return JSONResponse({"error": "missing_user_id"}, status_code=400)
+
+    existing = LINK_CODES_BY_USER.pop(destiny_id, None)
+    if existing:
+        LINK_CODES.pop(existing, None)
+
+    code = make_link_code()
+    expires_at = time.time() + LINK_CODE_TTL_SECONDS
+    LINK_CODES[code] = {
+        "destiny_id": destiny_id,
+        "username": session.get("username", ""),
+        "nick": session.get("nick", ""),
+        "expires_at": expires_at,
+    }
+    LINK_CODES_BY_USER[destiny_id] = code
+    return JSONResponse({"code": code, "expiresAt": int(expires_at * 1000)}, status_code=200)
+
+
+@link_router.post("/redeem")
+def redeem_link_code(payload: RedeemRequest, server_key: Optional[str] = Header(default=None, alias="X-Server-Key")):
+    cleanup_link_codes()
+    if not LINK_SERVER_KEY:
+        raise HTTPException(status_code=500, detail="LINK_SERVER_KEY is not configured")
+    if not server_key or server_key != LINK_SERVER_KEY:
+        raise HTTPException(status_code=403, detail="forbidden")
+    if not payload.minecraftUuid:
+        raise HTTPException(status_code=400, detail="minecraftUuid is required")
+
+    code = (payload.code or "").strip().upper()
+    record = LINK_CODES.pop(code, None)
+    if not record:
+        raise HTTPException(status_code=404, detail="invalid_or_expired_code")
+
+    destiny_id = record.get("destiny_id")
+    if destiny_id and LINK_CODES_BY_USER.get(destiny_id) == code:
+        LINK_CODES_BY_USER.pop(destiny_id, None)
+
+    minecraft_uuid = payload.minecraftUuid.strip().lower()
+    try:
+        ensure_link_db()
+        save_link_binding(destiny_id, minecraft_uuid, record.get("nick", ""), record.get("username", ""))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print("Failed to save link binding:", exc)
+        raise HTTPException(status_code=500, detail="db_error")
+
+    dgg_id = record.get("destiny_id", "")
+    try:
+        dgg_id = int(dgg_id)
+    except Exception:
+        dgg_id = str(dgg_id)
+
+    return JSONResponse({"dggId": dgg_id, "dggNick": record.get("nick", "")}, status_code=200)
+
+
+@link_router.get("/status")
+def link_status(request: Request):
+    cleanup_link_codes()
+    session = get_session_from_request(request)
+    if not session:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    destiny_id = get_destiny_id(session)
+    if not destiny_id:
+        return JSONResponse({"error": "missing_user_id"}, status_code=400)
+
+    try:
+        ensure_link_db()
+        binding = fetch_link_binding(destiny_id)
+    except HTTPException as exc:
+        return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
+    except Exception as exc:
+        print("Failed to fetch link binding:", exc)
+        return JSONResponse({"error": "db_error"}, status_code=500)
+
+    pending_code = LINK_CODES_BY_USER.get(destiny_id)
+    pending_record = LINK_CODES.get(pending_code) if pending_code else None
+
+    response = {"linked": bool(binding)}
+    if binding:
+        linked_at_ms = int(float(binding.get("linked_at", 0)) * 1000)
+        response.update(
+            {
+                "minecraftUuid": binding.get("minecraft_uuid"),
+                "linkedAt": linked_at_ms,
+            }
+        )
+    if pending_record:
+        response.update(
+            {
+                "pendingCode": pending_code,
+                "pendingExpiresAt": int(pending_record.get("expires_at", 0) * 1000),
+            }
+        )
+
+    return JSONResponse(response, status_code=200)
+
+
 @app.get("/whoami")
 def whoami(request: Request):
     cookie = request.cookies.get(COOKIE_NAME)
@@ -280,3 +545,6 @@ def whoami(request: Request):
         "nick": session.get("nick", ""),
         "userinfo": session.get("userinfo", {}),
     })
+
+
+app.include_router(link_router)

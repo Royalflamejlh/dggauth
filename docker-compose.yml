@@ -29,13 +29,19 @@ services:
       DGG_CLIENT_ID: "YOUR_DGG_CLIENT_ID"
       DGG_CLIENT_SECRET: "YOUR_DGG_CLIENT_SECRET"
       REDIRECT_URI: "https://auth.dgglocal.com/callback"
-      POST_LOGIN_REDIRECT: "https://app.dgglocal.com/"
+      POST_LOGIN_REDIRECT: "http://localhost:5173/"
       SESSION_SIGNING_KEY: "CHANGE_ME_TO_A_LONG_RANDOM_STRING"
-      COOKIE_SECURE: "true"
+      COOKIE_SECURE: "false"
       COOKIE_SAMESITE: "Lax"
       COOKIE_DOMAIN: ".dgglocal.com"
       SESSION_TTL_SECONDS: "86400"
       ADMIN_USER_IDS: "12345,67890"
+      LINK_SERVER_KEY: "CHANGE_ME_SERVER_KEY"
+      LINK_DB_HOST: "mariadb"
+      LINK_DB_PORT: "3306"
+      LINK_DB_USER: "dggauth"
+      LINK_DB_PASSWORD: "change_me_password"
+      LINK_DB_NAME: "dggauth"
     restart: unless-stopped
     networks:
       - proxy
