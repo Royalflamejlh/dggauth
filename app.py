@@ -9,6 +9,7 @@ import threading
 from typing import Dict, Optional
 
 import requests
+import httpx
 import mysql.connector
 from mysql.connector import pooling
 from fastapi import FastAPI, Request, Response, Header, HTTPException, APIRouter
@@ -27,6 +28,7 @@ POST_LOGIN_REDIRECT = os.environ.get("POST_LOGIN_REDIRECT", "https://app.dggloca
 POST_LOGOUT_REDIRECT = os.environ.get("POST_LOGOUT_REDIRECT", POST_LOGIN_REDIRECT)
 LINK_CODE_TTL_SECONDS = int(os.environ.get("LINK_CODE_TTL_SECONDS", "600"))
 LINK_SERVER_KEY = os.environ.get("LINK_SERVER_KEY")
+MINECRAFT_PROFILE_CACHE_TTL = int(os.environ.get("MINECRAFT_PROFILE_CACHE_TTL", "300"))
 LINK_DB_HOST = os.environ.get("LINK_DB_HOST") or os.environ.get("DB_HOST")
 LINK_DB_PORT = int(os.environ.get("LINK_DB_PORT", os.environ.get("DB_PORT", "3306")))
 LINK_DB_USER = os.environ.get("LINK_DB_USER") or os.environ.get("DB_USER")
@@ -54,6 +56,7 @@ STATE_STORE: Dict[str, float] = {}
 LINK_CODES: Dict[str, dict] = {}
 # destiny_id -> link_code
 LINK_CODES_BY_USER: Dict[str, str] = {}
+MINECRAFT_PROFILE_CACHE: Dict[str, dict] = {}
 
 DB_CONFIG = None
 if LINK_DB_HOST and LINK_DB_USER and LINK_DB_PASSWORD and LINK_DB_NAME:
@@ -190,6 +193,13 @@ def cleanup_link_codes():
             user_id = record.get("destiny_id")
             if user_id and LINK_CODES_BY_USER.get(user_id) == code:
                 LINK_CODES_BY_USER.pop(user_id, None)
+
+
+def cleanup_minecraft_profile_cache():
+    now = time.time()
+    for key, record in list(MINECRAFT_PROFILE_CACHE.items()):
+        if record.get("expires_at", 0) < now:
+            MINECRAFT_PROFILE_CACHE.pop(key, None)
 
 
 def make_link_code(length: int = 8) -> str:
@@ -525,6 +535,40 @@ def link_status(request: Request):
         )
 
     return JSONResponse(response, status_code=200)
+
+
+@link_router.get("/minecraft-profile/{uuid}")
+async def minecraft_profile(uuid: str):
+    cleanup_minecraft_profile_cache()
+    key = (uuid or "").strip().lower()
+    if not key:
+        raise HTTPException(status_code=400, detail="invalid_uuid")
+
+    cached = MINECRAFT_PROFILE_CACHE.get(key)
+    if cached and cached.get("expires_at", 0) > time.time():
+        return JSONResponse(cached["data"], status_code=200)
+
+    url = f"https://api.minecraftservices.com/minecraft/profile/lookup/{key}"
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(url)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="lookup_failed") from exc
+
+    if resp.status_code == 404:
+        raise HTTPException(status_code=404, detail="not_found")
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail="upstream_error")
+    try:
+        data = resp.json()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="invalid_response") from exc
+
+    MINECRAFT_PROFILE_CACHE[key] = {
+        "data": data,
+        "expires_at": time.time() + MINECRAFT_PROFILE_CACHE_TTL,
+    }
+    return JSONResponse(data, status_code=200)
 
 
 @app.get("/whoami")
