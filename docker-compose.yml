@@ -41,6 +41,7 @@ services:
       LINK_DB_PORT: "3306"
       LINK_DB_USER: "dggauth"
       LINK_DB_PASSWORD: "change_me_password"
+      LINK_DB_PASSWORD_FILE: "/run/secrets/plugin_db_password"
       LINK_DB_NAME: "dggauth"
     restart: unless-stopped
     networks:

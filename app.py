@@ -19,6 +19,22 @@ from pydantic import BaseModel
 app = FastAPI()
 
 # -----------------------------
+# Helpers (config)
+# -----------------------------
+def read_secret_file(path: Optional[str]) -> Optional[str]:
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        print(f"Secret file not found: {path}")
+    except Exception as exc:
+        print(f"Failed to read secret file {path}: {exc}")
+    return None
+
+
+# -----------------------------
 # Config (env)
 # -----------------------------
 DGG_CLIENT_ID = os.environ["DGG_CLIENT_ID"]
@@ -32,7 +48,8 @@ MINECRAFT_PROFILE_CACHE_TTL = int(os.environ.get("MINECRAFT_PROFILE_CACHE_TTL", 
 LINK_DB_HOST = os.environ.get("LINK_DB_HOST") or os.environ.get("DB_HOST")
 LINK_DB_PORT = int(os.environ.get("LINK_DB_PORT", os.environ.get("DB_PORT", "3306")))
 LINK_DB_USER = os.environ.get("LINK_DB_USER") or os.environ.get("DB_USER")
-LINK_DB_PASSWORD = os.environ.get("LINK_DB_PASSWORD") or os.environ.get("DB_PASSWORD")
+LINK_DB_PASSWORD_FILE = os.environ.get("LINK_DB_PASSWORD_FILE") or os.environ.get("DB_PASSWORD_FILE")
+LINK_DB_PASSWORD = read_secret_file(LINK_DB_PASSWORD_FILE) or os.environ.get("LINK_DB_PASSWORD") or os.environ.get("DB_PASSWORD")
 LINK_DB_NAME = os.environ.get("LINK_DB_NAME") or os.environ.get("DB_NAME")
 
 SESSION_SIGNING_KEY = os.environ["SESSION_SIGNING_KEY"].encode("utf-8")
