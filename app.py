@@ -236,15 +236,24 @@ def init_db_pool():
             cursor = conn.cursor()
             cursor.execute(
                 """
-                CREATE TABLE IF NOT EXISTS link_bindings (
-                    id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-                    destiny_id VARCHAR(64) NOT NULL,
-                    minecraft_uuid VARCHAR(64) NOT NULL,
+                CREATE TABLE IF NOT EXISTS dgg_users (
+                    destiny_id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
                     nick VARCHAR(255),
-                    username VARCHAR(255),
+                    userinfo_json LONGTEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS account_links (
+                    mc_uuid VARCHAR(64) NOT NULL PRIMARY KEY,
+                    destiny_id BIGINT UNSIGNED NOT NULL,
                     linked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE KEY uq_destiny_id (destiny_id),
-                    UNIQUE KEY uq_minecraft_uuid (minecraft_uuid)
+                    CONSTRAINT fk_account_links_destiny_id
+                        FOREIGN KEY (destiny_id) REFERENCES dgg_users(destiny_id)
+                        ON DELETE CASCADE ON UPDATE CASCADE
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
                 """
             )
@@ -261,38 +270,97 @@ def get_db_connection():
     return DB_POOL.get_connection()
 
 
-def save_link_binding(destiny_id: str, minecraft_uuid: str, nick: str, username: str):
+def coerce_destiny_id(destiny_id: str) -> int:
+    try:
+        return int(destiny_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="invalid_destiny_id") from exc
+
+
+def upsert_dgg_user(destiny_id: str, nick: str, userinfo: dict):
     conn = get_db_connection()
+    did = coerce_destiny_id(destiny_id)
     try:
         cursor = conn.cursor()
         cursor.execute(
             """
-            INSERT INTO link_bindings (destiny_id, minecraft_uuid, nick, username)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO dgg_users (destiny_id, nick, userinfo_json)
+            VALUES (%s, %s, %s)
             ON DUPLICATE KEY UPDATE
-                minecraft_uuid = VALUES(minecraft_uuid),
                 nick = VALUES(nick),
-                username = VALUES(username),
-                linked_at = CURRENT_TIMESTAMP
+                userinfo_json = VALUES(userinfo_json),
+                updated_at = CURRENT_TIMESTAMP
             """,
-            (destiny_id, minecraft_uuid, nick, username),
+            (did, nick, json.dumps(userinfo, separators=(",", ":"), sort_keys=True)),
         )
         conn.commit()
     finally:
         conn.close()
 
 
-def fetch_link_binding(destiny_id: str) -> Optional[dict]:
+def save_account_link(destiny_id: str, minecraft_uuid: str):
+    conn = get_db_connection()
+    did = coerce_destiny_id(destiny_id)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO account_links (mc_uuid, destiny_id)
+            VALUES (%s, %s)
+            ON DUPLICATE KEY UPDATE
+                mc_uuid = VALUES(mc_uuid),
+                destiny_id = VALUES(destiny_id),
+                linked_at = CURRENT_TIMESTAMP
+            """,
+            (minecraft_uuid, did),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def fetch_account_link(destiny_id: str) -> Optional[dict]:
+    conn = get_db_connection()
+    did = coerce_destiny_id(destiny_id)
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT al.destiny_id,
+                   al.mc_uuid AS minecraft_uuid,
+                   UNIX_TIMESTAMP(al.linked_at) AS linked_at,
+                   du.nick,
+                   du.userinfo_json,
+                   UNIX_TIMESTAMP(du.updated_at) AS user_updated_at
+            FROM account_links al
+            LEFT JOIN dgg_users du ON du.destiny_id = al.destiny_id
+            WHERE al.destiny_id = %s
+            """,
+            (did,),
+        )
+        row = cursor.fetchone()
+        return row
+    finally:
+        conn.close()
+
+
+def fetch_account_link_by_uuid(mc_uuid: str) -> Optional[dict]:
     conn = get_db_connection()
     try:
         cursor = conn.cursor(dictionary=True)
         cursor.execute(
             """
-            SELECT destiny_id, minecraft_uuid, UNIX_TIMESTAMP(linked_at) AS linked_at, nick, username
-            FROM link_bindings
-            WHERE destiny_id = %s
+            SELECT al.destiny_id,
+                   al.mc_uuid AS minecraft_uuid,
+                   UNIX_TIMESTAMP(al.linked_at) AS linked_at,
+                   du.nick,
+                   du.userinfo_json,
+                   UNIX_TIMESTAMP(du.updated_at) AS user_updated_at
+            FROM account_links al
+            LEFT JOIN dgg_users du ON du.destiny_id = al.destiny_id
+            WHERE al.mc_uuid = %s
             """,
-            (destiny_id,),
+            (mc_uuid,),
         )
         row = cursor.fetchone()
         return row
@@ -372,9 +440,15 @@ def callback(code: str, state: str):
         "username": username,
         "nick": nick,
         "admin": bool(is_admin),
-        "userinfo": userinfo,  # keep full blob for /whoami/debug
+        "userinfo": userinfo,
         "exp": time.time() + SESSION_TTL_SECONDS,
     }
+
+    try:
+        ensure_link_db()
+        upsert_dgg_user(destiny_id, nick, userinfo)
+    except Exception as exc:
+        print("Failed to upsert dgg_user on login:", exc)
 
     cookie_val = sign_session(session)
     resp = RedirectResponse(POST_LOGIN_REDIRECT, status_code=302)
@@ -440,6 +514,15 @@ def create_link_code(request: Request):
     if not destiny_id:
         return JSONResponse({"error": "missing_user_id"}, status_code=400)
 
+    try:
+        ensure_link_db()
+        upsert_dgg_user(destiny_id, session.get("nick", ""), session.get("userinfo", {}))
+    except HTTPException as exc:
+        return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
+    except Exception as exc:
+        print("Failed to upsert dgg_user on link code creation:", exc)
+        return JSONResponse({"error": "db_error"}, status_code=500)
+
     existing = LINK_CODES_BY_USER.pop(destiny_id, None)
     if existing:
         LINK_CODES.pop(existing, None)
@@ -450,6 +533,7 @@ def create_link_code(request: Request):
         "destiny_id": destiny_id,
         "username": session.get("username", ""),
         "nick": session.get("nick", ""),
+        "userinfo": session.get("userinfo", {}),
         "expires_at": expires_at,
     }
     LINK_CODES_BY_USER[destiny_id] = code
@@ -478,7 +562,8 @@ def redeem_link_code(payload: RedeemRequest, server_key: Optional[str] = Header(
     minecraft_uuid = payload.minecraftUuid.strip().lower()
     try:
         ensure_link_db()
-        save_link_binding(destiny_id, minecraft_uuid, record.get("nick", ""), record.get("username", ""))
+        upsert_dgg_user(destiny_id, record.get("nick", ""), record.get("userinfo", {}) or {})
+        save_account_link(destiny_id, minecraft_uuid)
     except HTTPException:
         raise
     except Exception as exc:
@@ -507,7 +592,7 @@ def link_status(request: Request):
 
     try:
         ensure_link_db()
-        binding = fetch_link_binding(destiny_id)
+        binding = fetch_account_link(destiny_id)
     except HTTPException as exc:
         return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
     except Exception as exc:
@@ -526,6 +611,8 @@ def link_status(request: Request):
                 "linkedAt": linked_at_ms,
             }
         )
+        if binding.get("nick") is not None:
+            response["dggNick"] = binding.get("nick")
     if pending_record:
         response.update(
             {
@@ -535,6 +622,54 @@ def link_status(request: Request):
         )
 
     return JSONResponse(response, status_code=200)
+
+
+@link_router.get("/lookup")
+def link_lookup(uuid: Optional[str] = None, destinyId: Optional[str] = None):
+    cleanup_link_codes()
+    try:
+        ensure_link_db()
+    except HTTPException as exc:
+        return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
+
+    if (uuid and destinyId) or (not uuid and not destinyId):
+        return JSONResponse({"error": "provide_exactly_one_of_uuid_or_destinyId"}, status_code=400)
+
+    record: Optional[dict] = None
+    if uuid:
+        record = fetch_account_link_by_uuid(uuid.strip().lower())
+    else:
+        try:
+            record = fetch_account_link(destinyId)
+        except HTTPException as exc:
+            return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
+
+    if not record:
+        return JSONResponse({"error": "not_found"}, status_code=404)
+
+    linked_at_ms = int(float(record.get("linked_at", 0)) * 1000)
+    userinfo_json = record.get("userinfo_json")
+    try:
+        userinfo = json.loads(userinfo_json) if userinfo_json else {}
+    except Exception:
+        userinfo = {}
+
+    subscription_tier = ""
+    try:
+        subscription_tier = userinfo.get("subscription", {}).get("tier", "")
+    except Exception:
+        subscription_tier = ""
+
+    resp = {
+        "destinyId": str(record.get("destiny_id", "")),
+        "minecraftUuid": record.get("minecraft_uuid", ""),
+        "linkedAt": linked_at_ms,
+        "dggNick": record.get("nick", ""),
+        "subscriptionTier": subscription_tier,
+        "updatedAt": int(float(record.get("user_updated_at", 0)) * 1000),
+        "userinfo": userinfo,
+    }
+    return JSONResponse(resp, status_code=200)
 
 
 @link_router.get("/minecraft-profile/{uuid}")
