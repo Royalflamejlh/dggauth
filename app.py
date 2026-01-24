@@ -479,7 +479,10 @@ def callback(code: str, state: str):
 
 
 @app.get("/auth")
-def auth(request: Request):
+def auth(
+    request: Request,
+    require_admin: Optional[str] = Header(default=None, alias="X-Require-Admin"),
+):
     cookie = request.cookies.get(COOKIE_NAME)
     if not cookie:
         return PlainTextResponse("unauthorized", status_code=401)
@@ -487,6 +490,10 @@ def auth(request: Request):
     session = verify_session(cookie)
     if not session:
         return PlainTextResponse("unauthorized", status_code=401)
+
+    if (require_admin or "").lower() in ("1", "true", "yes", "on"):
+        if not session.get("admin"):
+            return PlainTextResponse("forbidden", status_code=403)
 
     ui = session.get("userinfo") or {}
 
