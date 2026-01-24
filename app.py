@@ -40,7 +40,7 @@ def read_secret_file(path: Optional[str]) -> Optional[str]:
 DGG_CLIENT_ID = os.environ["DGG_CLIENT_ID"]
 DGG_CLIENT_SECRET = os.environ["DGG_CLIENT_SECRET"]
 REDIRECT_URI = os.environ["REDIRECT_URI"]
-POST_LOGIN_REDIRECT = os.environ.get("POST_LOGIN_REDIRECT", "https://app.dgglocal.com/")
+POST_LOGIN_REDIRECT = os.environ.get("POST_LOGIN_REDIRECT", "https://mcdgg.net/")
 POST_LOGOUT_REDIRECT = os.environ.get("POST_LOGOUT_REDIRECT", POST_LOGIN_REDIRECT)
 LINK_CODE_TTL_SECONDS = int(os.environ.get("LINK_CODE_TTL_SECONDS", "600"))
 LINK_SERVER_KEY = os.environ.get("LINK_SERVER_KEY")
