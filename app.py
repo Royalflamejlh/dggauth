@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import threading
+import logging
 from typing import Dict, Optional
 
 import requests
@@ -37,6 +38,9 @@ def read_secret_file(path: Optional[str]) -> Optional[str]:
 # -----------------------------
 # Config (env)
 # -----------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("dggauth")
+
 DGG_CLIENT_ID = os.environ["DGG_CLIENT_ID"]
 DGG_CLIENT_SECRET = os.environ["DGG_CLIENT_SECRET"]
 REDIRECT_URI = os.environ["REDIRECT_URI"]
@@ -89,6 +93,7 @@ if LINK_DB_HOST and LINK_DB_USER and LINK_DB_PASSWORD and LINK_DB_NAME:
 DB_POOL: Optional[pooling.MySQLConnectionPool] = None
 DB_POOL_LOCK = threading.Lock()
 DB_POOL_READY = False
+DB_POOL_NAME = "link_pool"
 
 link_router = APIRouter(prefix="/link")
 
@@ -247,7 +252,8 @@ def init_db_pool():
     with DB_POOL_LOCK:
         if DB_POOL_READY:
             return
-        DB_POOL = pooling.MySQLConnectionPool(pool_name="link_pool", pool_size=5, **DB_CONFIG)
+        logger.info("Initializing DB pool %s", DB_POOL_NAME)
+        DB_POOL = pooling.MySQLConnectionPool(pool_name=DB_POOL_NAME, pool_size=5, **DB_CONFIG)
         conn = DB_POOL.get_connection()
         try:
             cursor = conn.cursor()
@@ -278,13 +284,47 @@ def init_db_pool():
         finally:
             conn.close()
         DB_POOL_READY = True
+        logger.info("DB pool %s ready", DB_POOL_NAME)
 
 
 def get_db_connection():
-    init_db_pool()
-    if not DB_POOL:
-        raise RuntimeError("DB pool is not initialized")
-    return DB_POOL.get_connection()
+    attempts = 0
+    last_exc = None
+    while attempts < 2:
+        try:
+            init_db_pool()
+            if not DB_POOL:
+                raise RuntimeError("DB pool is not initialized")
+            conn = DB_POOL.get_connection()
+            try:
+                conn.ping(reconnect=True, attempts=1, delay=0)
+            except Exception as exc:
+                logger.warning("DB ping failed, resetting pool and retrying: %s", exc)
+                conn.close()
+                reset_db_pool()
+                attempts += 1
+                last_exc = exc
+                continue
+            return conn
+        except Exception as exc:
+            logger.error("Failed to get DB connection (attempt %s): %s", attempts + 1, exc)
+            reset_db_pool()
+            last_exc = exc
+            attempts += 1
+    raise RuntimeError("DB connection failed") from last_exc
+
+
+def reset_db_pool():
+    global DB_POOL, DB_POOL_READY
+    with DB_POOL_LOCK:
+        if DB_POOL:
+            try:
+                DB_POOL._remove_connections()
+            except Exception:
+                pass
+        DB_POOL = None
+        DB_POOL_READY = False
+        logger.warning("DB pool reset")
 
 
 def coerce_destiny_id(destiny_id: str) -> int:
@@ -299,6 +339,7 @@ def upsert_dgg_user(destiny_id: str, nick: str, userinfo: dict):
     did = coerce_destiny_id(destiny_id)
     try:
         cursor = conn.cursor()
+        logger.info("Upserting dgg_user %s", did)
         cursor.execute(
             """
             INSERT INTO dgg_users (destiny_id, nick, userinfo_json)
@@ -311,6 +352,7 @@ def upsert_dgg_user(destiny_id: str, nick: str, userinfo: dict):
             (did, nick, json.dumps(userinfo, separators=(",", ":"), sort_keys=True)),
         )
         conn.commit()
+        logger.info("Upserted dgg_user %s", did)
     finally:
         conn.close()
 
@@ -320,6 +362,7 @@ def save_account_link(destiny_id: str, minecraft_uuid: str):
     did = coerce_destiny_id(destiny_id)
     try:
         cursor = conn.cursor()
+        logger.info("Saving account_link destiny_id=%s mc_uuid=%s", did, minecraft_uuid)
         cursor.execute(
             """
             INSERT INTO account_links (mc_uuid, destiny_id)
@@ -332,6 +375,7 @@ def save_account_link(destiny_id: str, minecraft_uuid: str):
             (minecraft_uuid, did),
         )
         conn.commit()
+        logger.info("Saved account_link destiny_id=%s mc_uuid=%s", did, minecraft_uuid)
     finally:
         conn.close()
 
@@ -341,6 +385,7 @@ def fetch_account_link(destiny_id: str) -> Optional[dict]:
     did = coerce_destiny_id(destiny_id)
     try:
         cursor = conn.cursor(dictionary=True)
+        logger.info("Fetching account_link by destiny_id=%s", did)
         cursor.execute(
             """
             SELECT al.destiny_id,
@@ -356,6 +401,7 @@ def fetch_account_link(destiny_id: str) -> Optional[dict]:
             (did,),
         )
         row = cursor.fetchone()
+        logger.info("Fetched account_link by destiny_id=%s found=%s", did, bool(row))
         return row
     finally:
         conn.close()
@@ -365,6 +411,7 @@ def fetch_account_link_by_uuid(mc_uuid: str) -> Optional[dict]:
     conn = get_db_connection()
     try:
         cursor = conn.cursor(dictionary=True)
+        logger.info("Fetching account_link by mc_uuid=%s", mc_uuid)
         cursor.execute(
             """
             SELECT al.destiny_id,
@@ -380,6 +427,7 @@ def fetch_account_link_by_uuid(mc_uuid: str) -> Optional[dict]:
             (mc_uuid,),
         )
         row = cursor.fetchone()
+        logger.info("Fetched account_link by mc_uuid=%s found=%s", mc_uuid, bool(row))
         return row
     finally:
         conn.close()
